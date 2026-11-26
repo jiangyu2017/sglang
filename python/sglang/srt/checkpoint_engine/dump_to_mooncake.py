@@ -58,6 +58,88 @@ class TensorRecord:
 
 
 @dataclass
+class AtomicTensorGroup:
+    """Set of tightly-coupled tensors that must never be split across buckets."""
+
+    key: str
+    records: List[TensorRecord]
+    size_aligned: int
+
+
+# Leaf parameter/quantization suffixes belonging to a single module. Stripping
+# only known parameter leaves keeps companion tensors (e.g. .weight +
+# .weight_scale_inv, or compressed-tensors .weight_packed/.weight_scale/
+# .weight_shape) atomic while avoiding accidental merging of pre-fused 3D MoE
+# tensors stored directly as module attributes (e.g. experts.gate_up_proj and
+# experts.down_proj).
+_COMPANION_LEAF_SUFFIXES = frozenset(
+    {
+        "weight",
+        "bias",
+        "weight_scale",
+        "weight_scale_inv",
+        "weight_scale_2",
+        "scale",
+        "scales",
+        "input_scale",
+        "input_scale_inv",
+        "k_scale",
+        "v_scale",
+        "q_scale",
+        "o_scale",
+        "weight_packed",
+        "weight_shape",
+        "weight_zero_point",
+        "qweight",
+        "qweight_type",
+        "qzeros",
+        "g_idx",
+        "wf",
+        "e_score_correction_bias",
+    }
+)
+
+# Declarative cross-module sibling fusion rules:
+#   (required_parent_segment, forbidden_parent_segment, sibling_children, group_tag)
+# Any tensors sharing the same parent module prefix whose child module names fall
+# into sibling_children are bound into one atomic group so streaming bucketed
+# model.load_weights() never loses half of a fused pair across bucket boundaries.
+AtomicSiblingRule = Tuple[Optional[str], Optional[str], frozenset, str]
+
+_FUSED_SIBLING_RULES: Tuple[AtomicSiblingRule, ...] = (
+    # MLA / Gated-MLA input projection fusion (DeepSeek-V2/V3/V3.2, Kimi-K2.5/2.6/2.7,
+    # Kimi-K2.5-Eagle3, GLM-4-MoE-Lite, GLM-5.2-DSA, Bailing-MoE, LongCat-Flash, Dots3)
+    (
+        None,
+        None,
+        frozenset({"q_a_proj", "kv_a_proj_with_mqa", "g_proj"}),
+        "__atomic_qkv_a_proj",
+    ),
+    # DSA sparse attention indexer fusion (DeepSeek-V3.2, GLM-5.2-DSA, Dots3)
+    (
+        "indexer",
+        None,
+        frozenset({"wk", "weights_proj"}),
+        "__atomic_indexer_wk",
+    ),
+    # DeepSeek-V4 compressor fusion (wkv + wgate -> wkv_gate)
+    (
+        "compressor",
+        None,
+        frozenset({"wkv", "wgate"}),
+        "__atomic_compressor_wkv_gate",
+    ),
+    # DeepSeek-V4 MLA input projection fusion (wq_a + wkv)
+    (
+        None,
+        "compressor",
+        frozenset({"wq_a", "wkv"}),
+        "__atomic_wqkv_a",
+    ),
+)
+
+
+@dataclass
 class _BufferWrapper:
     view: torch.Tensor
     backing: torch.Tensor
@@ -263,24 +345,121 @@ def _allocate_aligned_cpu(size: int) -> Tuple[torch.Tensor, torch.Tensor]:
     return view, raw
 
 
-def _partition_records(records: List[TensorRecord]) -> List[Tuple[List[TensorRecord], int]]:
+def _parent_matches_segment(parent: str, segment: str) -> bool:
+    return parent == segment or parent.endswith(f".{segment}")
+
+
+def _atomic_group_key(
+    tensor_name: str,
+    sibling_rules: Tuple[AtomicSiblingRule, ...] = _FUSED_SIBLING_RULES,
+) -> str:
+    """Return the atomic bucket-grouping key for a checkpoint tensor name.
+
+    Tensors sharing the same atomic group key are guaranteed to be packed into
+    the same bucket so per-bucket model.load_weights() calls never observe a
+    split parameter/scale pair or half of a fused projection.
+    """
+    module_path = tensor_name
+    if "." in tensor_name:
+        prefix, leaf = tensor_name.rsplit(".", 1)
+        if leaf in _COMPANION_LEAF_SUFFIXES:
+            module_path = prefix
+
+    if "." in module_path:
+        parent, child = module_path.rsplit(".", 1)
+        for req_parent, forbid_parent, children, tag in sibling_rules:
+            if child not in children:
+                continue
+            if req_parent is not None and not _parent_matches_segment(parent, req_parent):
+                continue
+            if forbid_parent is not None and _parent_matches_segment(parent, forbid_parent):
+                continue
+            return f"{parent}.{tag}"
+
+    return module_path
+
+
+def _group_tensor_records(
+    records: List[TensorRecord],
+    sibling_rules: Tuple[AtomicSiblingRule, ...] = _FUSED_SIBLING_RULES,
+) -> List[AtomicTensorGroup]:
+    """Group TensorRecords into deterministic, indivisible atomic units."""
+    grouped: Dict[str, List[TensorRecord]] = {}
+    for record in records:
+        key = _atomic_group_key(record.name, sibling_rules=sibling_rules)
+        grouped.setdefault(key, []).append(record)
+
+    groups: List[AtomicTensorGroup] = []
+    for key in sorted(grouped.keys()):
+        group_records = sorted(grouped[key], key=lambda record: record.name)
+        groups.append(
+            AtomicTensorGroup(
+                key=key,
+                records=group_records,
+                size_aligned=sum(record.size_aligned for record in group_records),
+            )
+        )
+    return groups
+
+
+def _verify_atomic_partitions(
+    partitions: List[Tuple[List[TensorRecord], int]],
+    expected_count: int,
+    sibling_rules: Tuple[AtomicSiblingRule, ...] = _FUSED_SIBLING_RULES,
+) -> None:
+    """Fail-closed check ensuring no tensor is lost/duplicated and no atomic group spans buckets."""
+    seen_names: set[str] = set()
+    group_bucket: Dict[str, int] = {}
+    for bucket_idx, (bucket_records, bucket_size) in enumerate(partitions):
+        computed_size = 0
+        for record in bucket_records:
+            if record.name in seen_names:
+                raise RuntimeError(f"Duplicate tensor {record.name} in partitioned buckets")
+            seen_names.add(record.name)
+            computed_size += record.size_aligned
+            gkey = _atomic_group_key(record.name, sibling_rules=sibling_rules)
+            prev_idx = group_bucket.get(gkey)
+            if prev_idx is not None and prev_idx != bucket_idx:
+                raise RuntimeError(
+                    f"Atomic group {gkey} was split across buckets {prev_idx} and {bucket_idx}"
+                )
+            group_bucket[gkey] = bucket_idx
+        if computed_size != bucket_size:
+            raise RuntimeError(
+                f"Bucket {bucket_idx} size mismatch: computed {computed_size} != reported {bucket_size}"
+            )
+    if len(seen_names) != expected_count:
+        raise RuntimeError(
+            f"Partitioned tensor count mismatch: got {len(seen_names)} != expected {expected_count}"
+        )
+
+
+def _partition_records(
+    records: List[TensorRecord],
+    bucket_size_bytes: Optional[int] = None,
+    sibling_rules: Tuple[AtomicSiblingRule, ...] = _FUSED_SIBLING_RULES,
+) -> List[Tuple[List[TensorRecord], int]]:
     if not records:
         return []
-    max_tensor = max(record.size_aligned for record in records)
-    bucket_size = max(1 << 28, max_tensor)
+    groups = _group_tensor_records(records, sibling_rules=sibling_rules)
+    max_group = max(group.size_aligned for group in groups)
+    target_min = 1 << 28 if bucket_size_bytes is None else bucket_size_bytes
+    bucket_size = max(target_min, max_group)
 
     partitions: List[Tuple[List[TensorRecord], int]] = []
     current: List[TensorRecord] = []
     current_size = 0
-    for record in records:
-        if current and current_size + record.size_aligned > bucket_size:
+    for group in groups:
+        if current and current_size + group.size_aligned > bucket_size:
             partitions.append((current, current_size))
             current = []
             current_size = 0
-        current.append(record)
-        current_size += record.size_aligned
+        current.extend(group.records)
+        current_size += group.size_aligned
     if current:
         partitions.append((current, current_size))
+
+    _verify_atomic_partitions(partitions, len(records), sibling_rules=sibling_rules)
     return partitions
 
 
