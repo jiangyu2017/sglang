@@ -219,15 +219,51 @@ def verify_checkpoint_integrity(
     return len(missing) == 0, missing
 
 
-def _rebalance_manifest(manifest: dict[str, Any], world_size: int, strategy: str) -> dict[str, Any]:
+def _rebalance_manifest(
+    manifest: dict[str, Any],
+    world_size: int,
+    strategy: str,
+    *,
+    hierarchical: bool = False,
+    local_world_size: int = 1,
+    num_nics: int = 1,
+) -> dict[str, Any]:
     """Rebalance bucket ownership across ranks."""
     if world_size <= 1 or strategy == "none":
         return manifest
     assert strategy == "round_robin", f"Unsupported rebalance strategy: {strategy}"
     updated = json.loads(json.dumps(manifest))
     buckets = updated.get("buckets", [])
-    for idx, entry in enumerate(buckets):
-        entry["owner_rank"] = idx % world_size
+    if (
+        hierarchical
+        and local_world_size > 1
+        and world_size % local_world_size == 0
+        and world_size // local_world_size > 1
+    ):
+        # Interleave across NIC rails AND nodes so every consecutive window of
+        # num_nics buckets drives all 400G NICs in parallel (full-duplex across nodes).
+        num_nodes = world_size // local_world_size
+        eff_nics = max(1, min(num_nics, local_world_size))
+        gpus_per_nic = max(1, local_world_size // eff_nics)
+        local_order: list[int] = []
+        for slot in range(gpus_per_nic):
+            for nic in range(eff_nics):
+                lr = nic * gpus_per_nic + slot
+                if lr < local_world_size and lr not in local_order:
+                    local_order.append(lr)
+        for lr in range(local_world_size):
+            if lr not in local_order:
+                local_order.append(lr)
+        owner_schedule: list[int] = []
+        for phase in range(num_nodes):
+            for pos, lr in enumerate(local_order):
+                nr = (pos + phase) % num_nodes
+                owner_schedule.append(nr * local_world_size + lr)
+        for idx, entry in enumerate(buckets):
+            entry["owner_rank"] = owner_schedule[idx % len(owner_schedule)]
+    else:
+        for idx, entry in enumerate(buckets):
+            entry["owner_rank"] = idx % world_size
     return updated
 
 
@@ -359,6 +395,8 @@ class _Profiler:
         self.total_buckets = total_buckets
         self.fetch_times: list[float] = [0.0] * total_buckets
         self.bcast_times: list[float] = [0.0] * total_buckets
+        self.inter_bcast_times: list[float] = [0.0] * total_buckets
+        self.intra_bcast_times: list[float] = [0.0] * total_buckets
         self.apply_times: list[float] = [0.0] * total_buckets
         self.bucket_sizes: list[int] = [0] * total_buckets
         self.bucket_owners: list[int] = [0] * total_buckets
@@ -374,10 +412,14 @@ class _Profiler:
         apply_time: float,
         size: int,
         owner: int,
+        inter_bcast_time: float = 0.0,
+        intra_bcast_time: float = 0.0,
     ) -> None:
         """Record timing for a single bucket."""
         self.fetch_times[idx] = fetch_time
         self.bcast_times[idx] = bcast_time
+        self.inter_bcast_times[idx] = inter_bcast_time
+        self.intra_bcast_times[idx] = intra_bcast_time
         self.apply_times[idx] = apply_time
         self.bucket_sizes[idx] = size
         self.bucket_owners[idx] = owner
@@ -397,6 +439,8 @@ class _Profiler:
 
         fetch_stats = _stats(self.fetch_times)
         bcast_stats = _stats(self.bcast_times)
+        inter_bcast_stats = _stats(self.inter_bcast_times)
+        intra_bcast_stats = _stats(self.intra_bcast_times)
         apply_stats = _stats(self.apply_times)
 
         # Rank-wise distribution
@@ -416,6 +460,8 @@ class _Profiler:
             "throughput_gib_s": total_size / total_time / (1024**3) if total_time > 0 else 0.0,
             "fetch": fetch_stats,
             "bcast": bcast_stats,
+            "inter_bcast": inter_bcast_stats,
+            "intra_bcast": intra_bcast_stats,
             "apply": apply_stats,
             "rank_distribution": rank_buckets,
         }
@@ -440,6 +486,14 @@ def _log_summary(rank: int, world_size: int, summaries: list[dict[str, Any] | No
         f"bcast: avg={bcast['avg']*1000:.1f}ms p99={bcast['p99']*1000:.1f}ms total={bcast['total']:.2f}s | "
         f"apply: avg={apply['avg']*1000:.1f}ms p99={apply['p99']*1000:.1f}ms total={apply['total']:.2f}s"
     )
+    inter_b = summary.get("inter_bcast", {})
+    intra_b = summary.get("intra_bcast", {})
+    if inter_b.get("total", 0.0) > 0.0 or intra_b.get("total", 0.0) > 0.0:
+        logger.info(
+            f"hierarchical bcast v2 (rank0): "
+            f"inter_rail avg={inter_b['avg']*1000:.1f}ms p99={inter_b['p99']*1000:.1f}ms total={inter_b['total']:.2f}s | "
+            f"intra_nvlink avg={intra_b['avg']*1000:.1f}ms p99={intra_b['p99']*1000:.1f}ms total={intra_b['total']:.2f}s"
+        )
 
     # Calculate pipeline efficiency
     stage_sum = fetch['total'] + bcast['total'] + apply['total']
@@ -472,6 +526,11 @@ class _PipelineStage:
         profiler: _Profiler,
         num_slots: int = 4,
         progress: Any = None,
+        intra_group: Any = None,
+        inter_group: Any = None,
+        local_world_size: int = 1,
+        node_rank: int = 0,
+        local_rank: int = 0,
     ):
         self.rank = rank
         self.device = device
@@ -482,9 +541,20 @@ class _PipelineStage:
         self.profiler = profiler
         self.num_slots = num_slots
         self.progress = progress
+        self.intra_group = intra_group
+        self.inter_group = inter_group
+        self.local_world_size = local_world_size
+        self.node_rank = node_rank
+        self.local_rank = local_rank
+        self.hierarchical = (intra_group is not None and inter_group is not None)
+
+        # Dedicated non-blocking CUDA streams for decoupled inter-node rail & intra-node NVLink stages
+        self.inter_stream = torch.cuda.Stream(device=device) if self.hierarchical else None
+        self.intra_stream = torch.cuda.Stream(device=device) if self.hierarchical else None
 
         # Pipeline queues (unbounded - slot management controls concurrency)
         self.fetch_queue: queue.Queue = queue.Queue()
+        self.inter_queue: queue.Queue = queue.Queue()
         self.bcast_queue: queue.Queue = queue.Queue()
         self.apply_queue: queue.Queue = queue.Queue()
 
@@ -500,20 +570,22 @@ class _PipelineStage:
 
         # Worker threads
         self.fetch_thread: threading.Thread | None = None
+        self.inter_bcast_thread: threading.Thread | None = None
         self.bcast_thread: threading.Thread | None = None
         self.apply_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
-        # Failures raised inside worker threads, re-raised by wait(). Without
-        # this a dead stage would leave its neighbours blocked on queues or
-        # slot events and hang the load (and the SGLang worker) forever.
         self.errors: list[BaseException] = []
 
     def start(self) -> None:
         """Start pipeline worker threads."""
         self.fetch_thread = threading.Thread(target=self._fetch_worker, daemon=True)
+        if self.hierarchical:
+            self.inter_bcast_thread = threading.Thread(target=self._inter_bcast_worker, daemon=True)
         self.bcast_thread = threading.Thread(target=self._bcast_worker, daemon=True)
         self.apply_thread = threading.Thread(target=self._apply_worker, daemon=True)
         self.fetch_thread.start()
+        if self.inter_bcast_thread:
+            self.inter_bcast_thread.start()
         self.bcast_thread.start()
         self.apply_thread.start()
 
@@ -526,6 +598,8 @@ class _PipelineStage:
         self.fetch_queue.put(None)
         if self.fetch_thread:
             self.fetch_thread.join()
+        if self.inter_bcast_thread:
+            self.inter_bcast_thread.join()
         if self.bcast_thread:
             self.bcast_thread.join()
         if self.apply_thread:
@@ -534,20 +608,13 @@ class _PipelineStage:
             raise RuntimeError(f"pipeline failed: {self.errors[0]}") from self.errors[0]
 
     def cancel_and_wait(self) -> None:
-        """Stop the pipeline and join all started threads.
-
-        Must be called before tearing down resources the workers may still be
-        touching (the ZMQ socket, the registered GPU buffer, the process
-        group); freeing those under a live thread is a use-after-free. A
-        worker parked in an uninterruptible call (store fetch, NCCL
-        collective, socket recv) delays the join until that call's own
-        timeout fires.
-        """
+        """Stop the pipeline and join all started threads."""
         self.stop_event.set()
         self.fetch_queue.put(None)
+        self.inter_queue.put(None)
         self.bcast_queue.put(None)
         self.apply_queue.put(None)
-        for thread in (self.fetch_thread, self.bcast_thread, self.apply_thread):
+        for thread in (self.fetch_thread, self.inter_bcast_thread, self.bcast_thread, self.apply_thread):
             if thread is not None and thread.is_alive():
                 thread.join()
 
@@ -562,7 +629,10 @@ class _PipelineStage:
         finally:
             if self.stop_event.is_set():
                 # Unblock the downstream stage even on abnormal exit.
-                self.bcast_queue.put(None)
+                if self.hierarchical:
+                    self.inter_queue.put(None)
+                else:
+                    self.bcast_queue.put(None)
 
     def _fetch_loop(self) -> None:
         # Check if we should skip broadcast (gloo is slow, better to have all ranks fetch)
@@ -571,7 +641,10 @@ class _PipelineStage:
         while not self.stop_event.is_set():
             task = self.fetch_queue.get()
             if task is None:
-                self.bcast_queue.put(None)
+                if self.hierarchical:
+                    self.inter_queue.put(None)
+                else:
+                    self.bcast_queue.put(None)
                 break
 
             slot_id = task["slot_id"]
@@ -615,15 +688,52 @@ class _PipelineStage:
 
             task["fetch_time"] = fetch_elapsed
             task["skip_broadcast"] = skip_broadcast
-            self.bcast_queue.put(task)
+            if self.hierarchical:
+                self.inter_queue.put(task)
+            else:
+                self.bcast_queue.put(task)
+
+    def _inter_bcast_worker(self) -> None:
+        """Stage 2a worker: rail-optimized inter-node NCCL broadcast on dedicated stream."""
+        try:
+            torch.cuda.set_device(self.device)
+            while not self.stop_event.is_set():
+                task = self.inter_queue.get()
+                if task is None:
+                    self.bcast_queue.put(None)
+                    break
+
+                owner_rank = task["owner_rank"]
+                size = task["size"]
+                slot_id = task["slot_id"]
+                slot_offset = slot_id * self.max_bucket_size
+                slot_buffer = self.buffer.narrow(0, slot_offset, size)
+                owner_local = owner_rank % self.local_world_size
+
+                inter_elapsed = 0.0
+                if not task.get("skip_broadcast", False) and self.local_rank == owner_local:
+                    t_inter = time.perf_counter()
+                    with torch.cuda.stream(self.inter_stream):
+                        dist.broadcast(slot_buffer, src=owner_rank, group=self.inter_group, async_op=False)
+                    self.inter_stream.synchronize()
+                    inter_elapsed = time.perf_counter() - t_inter
+
+                task["inter_bcast_time"] = inter_elapsed
+                self.bcast_queue.put(task)
+        except BaseException as e:  # noqa: BLE001 - surfaced via wait()
+            logger.exception(f"[Rank {self.rank}] inter-node broadcast stage failed")
+            self.errors.append(e)
+            self.stop_event.set()
+        finally:
+            if self.stop_event.is_set():
+                self.bcast_queue.put(None)
 
     def _bcast_worker(self) -> None:
-        """Broadcast worker: distribute bucket to all ranks."""
+        """Broadcast worker: distribute bucket to all ranks (or intra-node NVLink in hierarchical mode)."""
         try:
+            torch.cuda.set_device(self.device)
             self._bcast_loop()
         except BaseException as e:  # noqa: BLE001 - surfaced via wait()
-            # A peer rank dying mid-collective surfaces here after the NCCL
-            # timeout (process-group timeout, 300s) rather than instantly.
             logger.exception(f"[Rank {self.rank}] broadcast stage failed")
             self.errors.append(e)
             self.stop_event.set()
@@ -632,7 +742,6 @@ class _PipelineStage:
                 self.apply_queue.put(None)
 
     def _bcast_loop(self) -> None:
-        # Check if using gloo backend (needs CPU-based broadcast)
         use_cpu_bcast = dist.get_backend() == "gloo"
 
         while not self.stop_event.is_set():
@@ -641,7 +750,6 @@ class _PipelineStage:
                 self.apply_queue.put(None)
                 break
 
-            idx = task["idx"]
             owner_rank = task["owner_rank"]
             size = task["size"]
             slot_id = task["slot_id"]
@@ -650,24 +758,34 @@ class _PipelineStage:
             skip_broadcast = task.get("skip_broadcast", False)
 
             bcast_start = time.perf_counter()
+            inter_elapsed = task.get("inter_bcast_time", 0.0)
+            intra_elapsed = 0.0
 
             if skip_broadcast:
-                # All ranks already fetched from store, just sync with barrier
                 dist.barrier()
+                torch.cuda.synchronize(self.device)
             elif use_cpu_bcast:
-                # Gloo doesn't support CUDA tensor broadcast, use CPU intermediate
                 cpu_buffer = slot_buffer.cpu()
                 dist.broadcast(cpu_buffer, src=owner_rank, async_op=False)
                 slot_buffer.copy_(cpu_buffer)
                 del cpu_buffer
+                torch.cuda.synchronize(self.device)
+            elif self.hierarchical:
+                owner_local = owner_rank % self.local_world_size
+                local_src = self.node_rank * self.local_world_size + owner_local
+                with torch.cuda.stream(self.intra_stream):
+                    dist.broadcast(slot_buffer, src=local_src, group=self.intra_group, async_op=False)
+                self.intra_stream.synchronize()
+                intra_elapsed = time.perf_counter() - bcast_start
             else:
-                # NCCL supports direct CUDA tensor broadcast
                 dist.broadcast(slot_buffer, src=owner_rank, async_op=False)
+                torch.cuda.synchronize(self.device)
 
-            torch.cuda.synchronize(self.device)  # Required: ensure GPU kernel completes before apply worker reads
-            bcast_elapsed = time.perf_counter() - bcast_start
+            bcast_elapsed = (inter_elapsed + intra_elapsed) if self.hierarchical else (time.perf_counter() - bcast_start)
 
             task["bcast_time"] = bcast_elapsed
+            task["inter_bcast_time"] = inter_elapsed
+            task["intra_bcast_time"] = intra_elapsed
             self.apply_queue.put(task)
 
     def _apply_worker(self) -> None:
@@ -726,6 +844,8 @@ class _PipelineStage:
                     apply_time=apply_elapsed,
                     size=current_task["size"],
                     owner=current_task["owner_rank"],
+                    inter_bcast_time=current_task.get("inter_bcast_time", 0.0),
+                    intra_bcast_time=current_task.get("intra_bcast_time", 0.0),
                 )
 
                 # Update progress bar after task completion
@@ -774,6 +894,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--rebalance-buckets", default="round_robin", choices=["none", "round_robin"])
     parser.add_argument("--pipeline-depth", type=int, default=4, help="Number of buffer slots (default: 4)")
+    parser.add_argument(
+        "--hierarchical-broadcast",
+        action="store_true",
+        help="Use 4-NIC rail-bound 4-stage pipelined hierarchical NCCL broadcast (inter-node rail + intra-node NVLink)",
+    )
     parser.add_argument("--flush-cache", action="store_true", help="Flush cache after weight update")
     parser.add_argument(
         "--update-timeout",
@@ -879,7 +1004,16 @@ def init_resources(
     prefix = args.prefix or f"ckpt:{ckpt_name}"
     manifest_key = f"{prefix}:manifest"
     manifest = _load_manifest(store, manifest_key)
-    manifest = _rebalance_manifest(manifest, world_size, args.rebalance_buckets)
+    lws_env = int(os.getenv("LOCAL_WORLD_SIZE", str(world_size)))
+    rdma_list = [d.strip() for d in (args.rdma_devices or "").split(",") if d.strip()]
+    manifest = _rebalance_manifest(
+        manifest,
+        world_size,
+        args.rebalance_buckets,
+        hierarchical=getattr(args, "hierarchical_broadcast", False),
+        local_world_size=lws_env,
+        num_nics=max(1, len(rdma_list)),
+    )
     buckets = manifest.get("buckets", [])
     # With --rebalance-buckets none the manifest's owner_rank is used as-is;
     # an owner outside the group would make dist.broadcast fail obscurely.
@@ -1045,9 +1179,54 @@ def do_load(
 
     try:
         # ========== Phase 1: Initialize process group ==========
+        local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", str(world_size)))
+        local_rank = int(os.getenv("LOCAL_RANK", str(rank % local_world_size)))
+        node_rank = rank // local_world_size
+        num_nodes = world_size // local_world_size
+        use_hier = (
+            getattr(args, "hierarchical_broadcast", False)
+            and num_nodes > 1
+            and world_size % local_world_size == 0
+        )
+        if use_hier:
+            rdma_list = [d.strip() for d in (args.rdma_devices or "").split(",") if d.strip()]
+            if len(rdma_list) >= 2:
+                gpus_per_nic = max(1, local_world_size // len(rdma_list))
+                my_nic = rdma_list[(local_rank // gpus_per_nic) % len(rdma_list)]
+                os.environ["NCCL_IB_HCA"] = my_nic
+                os.environ["NCCL_CROSS_NIC"] = "1"
+                os.environ["NCCL_NET_GDR_LEVEL"] = "PIX"
+                logger.info(f"[Rank {rank}] Rail-bound PIX NIC: local_rank={local_rank} -> NCCL_IB_HCA={my_nic}")
+
         _init_process_group(device_id=gpu_index)
         if rank == 0:
             logger.info(f"Loading checkpoint -> {ep}")
+
+        intra_group = None
+        inter_group = None
+        if use_hier and dist.get_backend() == "nccl":
+            t_hb = time.perf_counter()
+            for n in range(num_nodes):
+                node_ranks = list(range(n * local_world_size, (n + 1) * local_world_size))
+                pg = dist.new_group(ranks=node_ranks, backend="nccl", timeout=timedelta(seconds=300))
+                if n == node_rank:
+                    intra_group = pg
+            for r in range(local_world_size):
+                rail_ranks = [n * local_world_size + r for n in range(num_nodes)]
+                pg = dist.new_group(ranks=rail_ranks, backend="nccl", timeout=timedelta(seconds=300))
+                if r == local_rank:
+                    inter_group = pg
+            warmup_buf = torch.zeros(1, dtype=torch.uint8, device=device)
+            dist.broadcast(warmup_buf, src=node_rank * local_world_size, group=intra_group)
+            dist.broadcast(warmup_buf, src=local_rank, group=inter_group)
+            torch.cuda.synchronize(device)
+            del warmup_buf
+            if rank == 0:
+                logger.info(
+                    f"Hierarchical broadcast v2 enabled: num_nodes={num_nodes}, "
+                    f"local_world_size={local_world_size} (4-NIC PIX rail + 4-stage pipeline warmed up in "
+                    f"{time.perf_counter() - t_hb:.2f}s)"
+                )
 
         # ========== Phase 2: Wait for SGLang ready ==========
         _check_sglang_ready(
@@ -1156,7 +1335,20 @@ def do_load(
         ]
 
         pipeline = _PipelineStage(
-            rank, device, store, buffer, max_bucket_size, socket, profiler, args.pipeline_depth, progress
+            rank,
+            device,
+            store,
+            buffer,
+            max_bucket_size,
+            socket,
+            profiler,
+            args.pipeline_depth,
+            progress,
+            intra_group=intra_group,
+            inter_group=inter_group,
+            local_world_size=local_world_size,
+            node_rank=node_rank,
+            local_rank=local_rank,
         )
         pipeline.start()
         logger.info(f"[Rank {rank}] Pipeline started, submitting {len(buckets)} buckets...")
