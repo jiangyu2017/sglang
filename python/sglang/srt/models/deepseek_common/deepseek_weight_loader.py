@@ -196,21 +196,47 @@ class DeepseekV2WeightLoaderMixin:
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
-        )
-        # Params for special naming rules in mixed-precision models, for example:
-        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
-        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
-        if is_wint4afp8_or_wint4a16_config(self.quant_config):
-            expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
-                num_experts=self.config.n_routed_experts
+        session = getattr(self, "_sglang_weight_load_session", None)
+        cache_key = ("deepseek_v2_loader_cache", is_nextn)
+        cached = session.get(cache_key) if session is not None else None
+        if cached is not None:
+            (
+                expert_params_mapping,
+                expert_mapping_by_key,
+                params_dict,
+                indexer_present_prefixes,
+            ) = cached
+        else:
+            # Params for weights, fp8 weight scales, fp8 activation scales
+            # (param_name, weight_name, expert_id, shard_id)
+            expert_params_mapping = FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
             )
+            # Params for special naming rules in mixed-precision models, for example:
+            # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
+            # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
+            if is_wint4afp8_or_wint4a16_config(self.quant_config):
+                expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
+                    num_experts=self.config.n_routed_experts
+                )
+            expert_mapping_by_key = {
+                weight_name: (param_name, weight_name, expert_id, shard_id)
+                for param_name, weight_name, expert_id, shard_id in expert_params_mapping
+            }
+            params_dict = dict(self.named_parameters())
+            indexer_present_prefixes = {
+                n.rsplit(".indexer.", 1)[0] for n in params_dict if ".indexer." in n
+            }
+            if session is not None:
+                session[cache_key] = (
+                    expert_params_mapping,
+                    expert_mapping_by_key,
+                    params_dict,
+                    indexer_present_prefixes,
+                )
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
@@ -222,15 +248,15 @@ class DeepseekV2WeightLoaderMixin:
 
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
-            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+            if session is None or not session.get("_logged_shared_fusion"):
+                log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+                if session is not None:
+                    session["_logged_shared_fusion"] = True
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = []
-            params_dict = dict(self.named_parameters())
-            indexer_present_prefixes = {
-                n.rsplit(".indexer.", 1)[0] for n in params_dict if ".indexer." in n
-            }
-            weight_names = []
+        executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        futures = []
+        weight_names = []
+        try:
 
             for name, loaded_weight in weights:
                 use_async_loading = should_async_load(loaded_weight)
@@ -322,6 +348,8 @@ class DeepseekV2WeightLoaderMixin:
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
+                    if use_async_loading and executor is None:
+                        executor = concurrent.futures.ThreadPoolExecutor()
                     maybe_executor_submit(
                         executor=executor,
                         futures=futures,
@@ -331,34 +359,81 @@ class DeepseekV2WeightLoaderMixin:
                     )
                     break
                 else:
-                    for mapping in expert_params_mapping:
-                        param_name, weight_name, expert_id, shard_id = mapping
-                        if weight_name not in name:
-                            continue
-                        if _is_npu:
-                            name = name.replace("weight_packed", "weight")
-                        name = name.replace(weight_name, param_name)
-                        if name not in params_dict:
-                            continue
-                        param = params_dict[name]
-                        weight_loader = param.weight_loader
-                        maybe_executor_submit(
-                            executor=executor,
-                            futures=futures,
-                            use_async=use_async_loading,
-                            func=weight_loader,
-                            func_args=(
-                                param,
-                                loaded_weight,
-                                name,
-                            ),
-                            func_kwargs={
-                                "shard_id": shard_id,
-                                "expert_id": expert_id,
-                            },
-                        )
-                        break
-                    else:
+                    matched_expert = False
+                    exp_idx = name.find("experts.")
+                    if exp_idx != -1:
+                        exp_parts = name[exp_idx:].split(".", 3)
+                        candidate = None
+                        if len(exp_parts) >= 4:
+                            candidate = expert_mapping_by_key.get(
+                                f"experts.{exp_parts[1]}.{exp_parts[2]}."
+                            )
+                        if candidate is None and len(exp_parts) >= 4:
+                            candidate = expert_mapping_by_key.get(
+                                f"experts.{exp_parts[1]}.{exp_parts[2]}.{exp_parts[3]}"
+                            )
+                        if candidate is not None:
+                            param_name, weight_name, expert_id, shard_id = candidate
+                            mapped_name = (
+                                name.replace("weight_packed", "weight")
+                                if _is_npu
+                                else name
+                            )
+                            mapped_name = mapped_name.replace(weight_name, param_name)
+                            param = params_dict.get(mapped_name)
+                            if param is not None:
+                                weight_loader = param.weight_loader
+                                if use_async_loading:
+                                    if executor is None:
+                                        executor = concurrent.futures.ThreadPoolExecutor()
+                                    maybe_executor_submit(
+                                        executor=executor,
+                                        futures=futures,
+                                        use_async=True,
+                                        func=weight_loader,
+                                        func_args=(param, loaded_weight, mapped_name),
+                                        func_kwargs={
+                                            "shard_id": shard_id,
+                                            "expert_id": expert_id,
+                                        },
+                                    )
+                                else:
+                                    weight_loader(
+                                        param,
+                                        loaded_weight,
+                                        mapped_name,
+                                        shard_id=shard_id,
+                                        expert_id=expert_id,
+                                    )
+                                matched_expert = True
+                        else:
+                            for mapping in expert_params_mapping:
+                                param_name, weight_name, expert_id, shard_id = mapping
+                                if weight_name not in name:
+                                    continue
+                                if _is_npu:
+                                    name = name.replace("weight_packed", "weight")
+                                name = name.replace(weight_name, param_name)
+                                if name not in params_dict:
+                                    continue
+                                param = params_dict[name]
+                                weight_loader = param.weight_loader
+                                if use_async_loading and executor is None:
+                                    executor = concurrent.futures.ThreadPoolExecutor()
+                                maybe_executor_submit(
+                                    executor=executor,
+                                    futures=futures,
+                                    use_async=use_async_loading,
+                                    func=weight_loader,
+                                    func_args=(param, loaded_weight, name),
+                                    func_kwargs={
+                                        "shard_id": shard_id,
+                                        "expert_id": expert_id,
+                                    },
+                                )
+                                matched_expert = True
+                                break
+                    if not matched_expert:
                         # Skip loading extra bias for GPTQ models.
                         if name.endswith(".bias") and name not in params_dict:
                             continue
@@ -425,6 +500,8 @@ class DeepseekV2WeightLoaderMixin:
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )
+                                if use_async_loading and executor is None:
+                                    executor = concurrent.futures.ThreadPoolExecutor()
                                 maybe_executor_submit(
                                     executor=executor,
                                     futures=futures,
@@ -455,6 +532,8 @@ class DeepseekV2WeightLoaderMixin:
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
+                            if use_async_loading and executor is None:
+                                executor = concurrent.futures.ThreadPoolExecutor()
                             maybe_executor_submit(
                                 executor=executor,
                                 futures=futures,
@@ -464,8 +543,12 @@ class DeepseekV2WeightLoaderMixin:
                             )
 
             # Wait for all tasks to complete and raise any exceptions.
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
+            if futures:
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 

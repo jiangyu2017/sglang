@@ -95,13 +95,25 @@ class SGLangCheckpointEngineWorkerExtension:
         # long teardown may wait on an undeliverable message.
         ctx.setsockopt(zmq.LINGER, CE_IPC_LINGER_MS)
         try:
-            update_weights_from_ipc(
-                ctx,
-                zmq_handles[device_uuid],
-                device_id=device_id,
-                run=self.get_model_loader(),
-                post_hook=self.get_post_hook(),
-            )
+            model = getattr(getattr(self, "model_runner", None), "model", None)
+            if model is not None:
+                from sglang.srt.model_loader.utils import restore_weights_before_loading
+
+                # Restore quantized runtime layouts ONCE per IPC update session
+                # rather than walking model.named_modules() on every bucket.
+                restore_weights_before_loading(model)
+                model._sglang_weight_load_session = {}
+            try:
+                update_weights_from_ipc(
+                    ctx,
+                    zmq_handles[device_uuid],
+                    device_id=device_id,
+                    run=self.get_model_loader(),
+                    post_hook=self.get_post_hook(),
+                )
+            finally:
+                if model is not None and hasattr(model, "_sglang_weight_load_session"):
+                    delattr(model, "_sglang_weight_load_session")
         finally:
             # Destroy the context explicitly with a bounded linger rather than
             # leaving it to GC: the __del__ -> destroy -> term() path has no
@@ -146,13 +158,10 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
         """Get the model weight loader function."""
 
         def model_loader(weights):
-            from sglang.srt.model_loader.utils import restore_weights_before_loading
+            if not hasattr(self.model_runner.model, "_sglang_weight_load_session"):
+                from sglang.srt.model_loader.utils import restore_weights_before_loading
 
-            # Quantization schemes may have repacked parameters into a
-            # runtime layout (either at initial load for dummy-initialized
-            # models, or by a previous online update); restore the
-            # checkpoint-loading layout before writing new weights.
-            restore_weights_before_loading(self.model_runner.model)
+                restore_weights_before_loading(self.model_runner.model)
             return self.model_runner.model.load_weights(weights)
 
         return model_loader

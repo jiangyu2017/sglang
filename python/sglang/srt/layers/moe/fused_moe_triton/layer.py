@@ -1175,15 +1175,18 @@ class FusedMoE(torch.nn.Module):
 
             clear_mxfp8_shuffle_index_cache()
 
+        # Use zero-copy .t() view here instead of .t().contiguous(): downstream
+        # _load_w13 / _load_w2 narrow to the local 1/TP shard first and copy_
+        # supports strided views directly, avoiding 16x full-tensor temp allocs.
         loaded_weight = (
-            loaded_weight.t().contiguous()
+            loaded_weight.t()
             if (
                 method.__class__.__name__
-                in [
+                in (
                     "CompressedTensorsWNA16MarlinMoE",
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
-                ]
+                )
             )
             and "zero" not in weight_name
             else loaded_weight

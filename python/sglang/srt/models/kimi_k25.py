@@ -862,11 +862,16 @@ class KimiK25ForConditionalGeneration(nn.Module):
         if mapper is not None:
             weights = mapper.apply(weights)
 
-        vision_params = (
-            None
-            if self.config.language_only
-            else dict(self.named_parameters(remove_duplicate=False))
-        )
+        session = getattr(self, "_sglang_weight_load_session", None)
+        if self.config.language_only:
+            vision_params = None
+        elif session is not None:
+            vision_params = session.get("vision_params")
+            if vision_params is None:
+                vision_params = dict(self.named_parameters(remove_duplicate=False))
+                session["vision_params"] = vision_params
+        else:
+            vision_params = dict(self.named_parameters(remove_duplicate=False))
 
         def stream_language_weights():
             for name, loaded_weight in weights:
@@ -890,7 +895,13 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 yield name.replace("language_model.", ""), loaded_weight
 
         if self.language_model is not None:
-            self.language_model.load_weights(stream_language_weights())
+            if session is not None:
+                self.language_model._sglang_weight_load_session = session
+            try:
+                self.language_model.load_weights(stream_language_weights())
+            finally:
+                if session is not None and hasattr(self.language_model, "_sglang_weight_load_session"):
+                    delattr(self.language_model, "_sglang_weight_load_session")
         else:
             # encoder-only: drain the generator so inline vision-weight loading fires.
             for _ in stream_language_weights():
