@@ -46,7 +46,9 @@ import argparse
 import json
 import os
 import queue
+import marshal
 import socket
+import struct
 import sys
 import threading
 import time
@@ -531,6 +533,7 @@ class _PipelineStage:
         local_world_size: int = 1,
         node_rank: int = 0,
         local_rank: int = 0,
+        fast_ipc: bool = False,
     ):
         self.rank = rank
         self.device = device
@@ -546,6 +549,7 @@ class _PipelineStage:
         self.local_world_size = local_world_size
         self.node_rank = node_rank
         self.local_rank = local_rank
+        self.fast_ipc = fast_ipc
         self.hierarchical = (intra_group is not None and inter_group is not None)
 
         # Dedicated non-blocking CUDA streams for decoupled inter-node rail & intra-node NVLink stages
@@ -827,14 +831,18 @@ class _PipelineStage:
                 slot_offset = slot_id * self.max_bucket_size
 
                 apply_start = time.perf_counter()
-                payload = _make_payload(items, slot_offset)
-                self.socket.send_pyobj(payload)
+                if self.fast_ipc:
+                    # P1-1: 12-byte binary trigger (zero per-bucket pickle)
+                    self.socket.send(b"SGBK" + struct.pack("<II", current_task["idx"], slot_id))
+                else:
+                    payload = _make_payload(items, slot_offset)
+                    self.socket.send_pyobj(payload)
                 _recv_worker_ack(
                     self.socket, f"bucket {current_task['idx']} weight load"
                 )
                 apply_elapsed = time.perf_counter() - apply_start
 
-                # Release slot after SGLang confirms data read
+                # Release slot immediately after worker apply_stream Event sync (~3.6ms)
                 self.slot_available[slot_id].set()
 
                 self.profiler.record(
@@ -897,7 +905,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hierarchical-broadcast",
         action="store_true",
-        help="Use 4-NIC rail-bound 4-stage pipelined hierarchical NCCL broadcast (inter-node rail + intra-node NVLink)",
+        help="Use rail-bound 4-stage pipelined hierarchical NCCL broadcast (inter-node rail + intra-node NVLink)",
+    )
+    parser.add_argument(
+        "--fast-ipc",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable P1 fast IPC (one-shot marshal manifest, pre-built _foreach_copy_, dedicated apply_stream; default: enabled)",
     )
     parser.add_argument("--flush-cache", action="store_true", help="Flush cache after weight update")
     parser.add_argument(
@@ -1195,7 +1209,7 @@ def do_load(
                 my_nic = rdma_list[(local_rank // gpus_per_nic) % len(rdma_list)]
                 os.environ["NCCL_IB_HCA"] = my_nic
                 os.environ["NCCL_CROSS_NIC"] = "1"
-                os.environ["NCCL_NET_GDR_LEVEL"] = "PIX"
+                os.environ["NCCL_NET_GDR_LEVEL"] = "PIX" if gpus_per_nic <= 2 else "SYS"
                 logger.info(f"[Rank {rank}] Rail-bound PIX NIC: local_rank={local_rank} -> NCCL_IB_HCA={my_nic}")
 
         _init_process_group(device_id=gpu_index)
@@ -1303,11 +1317,28 @@ def do_load(
             acknowledge_initial_error=True,
         )
         logger.info(f"[Rank {rank}] CUDA IPC handle response received")
-        # Steady state: per-bucket apply acks arrive within seconds; a much
-        # tighter bound than the handshake so a worker that dies mid-load
-        # fails the pipeline instead of hanging it. Phase 6 manages its own
-        # timeouts on top of these.
         socket.setsockopt(zmq.RCVTIMEO, APPLY_ACK_TIMEOUT_MS)
+
+        use_fast_ipc = bool(getattr(args, "fast_ipc", False))
+        if use_fast_ipc:
+            t_fi = time.perf_counter()
+            compact_buckets = [
+                [
+                    (item["name"], item["dtype"], tuple(item["shape"]), item["offset"])
+                    for item in entry["items"]
+                ]
+                for entry in buckets
+            ]
+            socket.send(
+                b"SGMF"
+                + marshal.dumps((max_bucket_size, args.pipeline_depth, compact_buckets))
+            )
+            _recv_worker_ack(socket, "fast IPC manifest init")
+            if rank == 0:
+                logger.info(
+                    f"Fast IPC v1 manifest handshake & plan compilation completed in "
+                    f"{time.perf_counter() - t_fi:.2f}s"
+                )
 
         # ========== Phase 4: Execute pipeline ==========
         logger.info(f"[Rank {rank}] Phase 4: Creating pipeline (num_buckets={len(buckets)})...")
@@ -1349,6 +1380,7 @@ def do_load(
             local_world_size=local_world_size,
             node_rank=node_rank,
             local_rank=local_rank,
+            fast_ipc=use_fast_ipc,
         )
         pipeline.start()
         logger.info(f"[Rank {rank}] Pipeline started, submitting {len(buckets)} buckets...")
